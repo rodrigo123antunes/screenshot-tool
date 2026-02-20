@@ -13,8 +13,12 @@
     "windows": [
       {
         "title": "Screenshot Tool",
-        "width": 800,
-        "height": 600
+        "width": 1024,
+        "height": 768,
+        "minWidth": 640,
+        "minHeight": 480,
+        "decorations": false,
+        "transparent": false
       }
     ],
     "security": {
