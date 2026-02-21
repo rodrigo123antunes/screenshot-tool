@@ -83,6 +83,38 @@ fn should_keep_stable_field_names_for_shared_payloads() {
 }
 
 #[test]
+fn should_serialize_clipboard_error_to_clipboard_error_code() {
+    let error = CaptureError::new(CaptureErrorKind::ClipboardError);
+    let structured = StructuredError::from(error);
+
+    assert_eq!(
+        structured.code, "CLIPBOARD_ERROR",
+        "ClipboardError deve serializar para 'CLIPBOARD_ERROR'"
+    );
+    assert!(!structured.message.is_empty(), "message não deve ser vazia");
+    assert!(
+        structured.context.is_none(),
+        "context deve ser None quando não fornecido"
+    );
+}
+
+#[test]
+fn should_serialize_clipboard_error_with_context_via_structured_error() {
+    let error = CaptureError::new(CaptureErrorKind::ClipboardError)
+        .with_context("arboard set_image failed: display not found");
+    let structured = StructuredError::from(error);
+
+    let json = serde_json::to_string(&structured).expect("must serialize");
+    let restored: StructuredError = serde_json::from_str(&json).expect("must deserialize");
+
+    assert_eq!(restored.code, "CLIPBOARD_ERROR");
+    assert_eq!(
+        restored.context.as_deref(),
+        Some("arboard set_image failed: display not found")
+    );
+}
+
+#[test]
 fn should_serialize_enums_using_stable_wire_format() {
     let mode = serde_json::to_string(&CaptureModeName::Area).expect("must serialize");
     assert_eq!(mode, "\"area\"");
