@@ -1,4 +1,4 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock @tauri-apps/plugin-store
@@ -80,7 +80,9 @@ describe("App (Integration)", () => {
     // Start with light theme persisted
     mockGet.mockResolvedValue("light");
 
-    render(<App />);
+    await act(async () => {
+      render(<App />);
+    });
 
     await vi.waitFor(() => {
       expect(document.documentElement.classList.contains("dark")).toBe(false);
@@ -88,7 +90,9 @@ describe("App (Integration)", () => {
 
     // Click toggle: light -> dark
     const button = screen.getByRole("button", { name: /mode|theme/i });
-    fireEvent.click(button);
+    await act(async () => {
+      fireEvent.click(button);
+    });
 
     await vi.waitFor(() => {
       expect(document.documentElement.classList.contains("dark")).toBe(true);
@@ -98,7 +102,9 @@ describe("App (Integration)", () => {
   it("loads persisted theme from store on mount", async () => {
     mockGet.mockResolvedValue("dark");
 
-    render(<App />);
+    await act(async () => {
+      render(<App />);
+    });
 
     await vi.waitFor(() => {
       expect(mockGet).toHaveBeenCalledWith("theme");

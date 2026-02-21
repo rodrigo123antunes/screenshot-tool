@@ -103,11 +103,13 @@ describe("ThemeProvider", () => {
   it("loads theme from Tauri Store on mount", async () => {
     mockGet.mockResolvedValue("dark");
 
-    render(
-      <ThemeProvider defaultTheme="system">
-        <ThemeConsumer />
-      </ThemeProvider>,
-    );
+    await act(async () => {
+      render(
+        <ThemeProvider defaultTheme="system">
+          <ThemeConsumer />
+        </ThemeProvider>,
+      );
+    });
 
     await vi.waitFor(() => {
       expect(screen.getByTestId("theme")).toHaveTextContent("dark");

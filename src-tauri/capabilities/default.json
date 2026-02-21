@@ -6,6 +6,12 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "store:default"
+    "store:default",
+    "core:event:default",
+    "core:window:allow-create",
+    "core:window:allow-close",
+    "core:window:allow-set-always-on-top",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister"
   ]
 }
