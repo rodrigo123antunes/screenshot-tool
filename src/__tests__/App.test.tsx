@@ -16,11 +16,6 @@ vi.mock("@tauri-apps/plugin-store", () => ({
   },
 }));
 
-// Mock tauri-controls
-vi.mock("tauri-controls", () => ({
-  WindowControls: () => <div data-testid="window-controls">WindowControls</div>,
-}));
-
 import App from "@/App";
 
 describe("App (Integration)", () => {
@@ -56,8 +51,8 @@ describe("App (Integration)", () => {
     const shell = document.querySelector("div.flex.h-screen.flex-col");
     expect(shell).toBeInTheDocument();
 
-    // Titlebar (header with drag region)
-    const header = document.querySelector("[data-tauri-drag-region]");
+    // Titlebar (header element)
+    const header = document.querySelector("header");
     expect(header).toBeInTheDocument();
 
     // ContentArea (main element)
@@ -70,12 +65,6 @@ describe("App (Integration)", () => {
 
     const button = screen.getByRole("button", { name: /mode|theme/i });
     expect(button).toBeInTheDocument();
-  });
-
-  it("renders WindowControls in the titlebar", () => {
-    render(<App />);
-
-    expect(screen.getByTestId("window-controls")).toBeInTheDocument();
   });
 
   it("applies theme correctly via ThemeProvider", async () => {

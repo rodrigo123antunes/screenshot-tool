@@ -1,11 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect, vi } from "vitest";
 
-// Mock tauri-controls
-vi.mock("tauri-controls", () => ({
-  WindowControls: () => <div data-testid="window-controls">WindowControls</div>,
-}));
-
 // Mock theme module
 vi.mock("@/features/theme", () => ({
   ThemeToggle: () => <button data-testid="theme-toggle">ThemeToggle</button>,
