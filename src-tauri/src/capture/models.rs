@@ -2,18 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CaptureErrorKind, StructuredError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum CaptureModeName {
     Fullscreen,
     Window,
+    #[default]
     Area,
-}
-
-impl Default for CaptureModeName {
-    fn default() -> Self {
-        Self::Area
-    }
 }
 
 impl TryFrom<&str> for CaptureModeName {
