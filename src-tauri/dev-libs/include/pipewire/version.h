@@ -1,0 +1,35 @@
+/* PipeWire */
+/* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-License-Identifier: MIT */
+
+#ifndef PIPEWIRE_VERSION_H
+#define PIPEWIRE_VERSION_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stdbool.h>
+
+#define pw_get_headers_version() ("1.0.2")
+
+const char* pw_get_library_version(void);
+
+bool pw_check_library_version(int major, int minor, int micro);
+
+#define PW_API_VERSION 0
+
+#define PW_MAJOR 1
+#define PW_MINOR 0
+#define PW_MICRO 2
+
+#define PW_CHECK_VERSION(major,minor,micro)                             \
+    ((PW_MAJOR > (major)) ||                                            \
+     (PW_MAJOR == (major) && PW_MINOR > (minor)) ||                     \
+     (PW_MAJOR == (major) && PW_MINOR == (minor) && PW_MICRO >= (micro)))
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PIPEWIRE_VERSION_H */

@@ -1,0 +1,13 @@
+# This file is auto-generated — paths are relative to the dev-libs directory.
+# The PKG_CONFIG_PATH must point to this directory for pkg-config to find it.
+# See Makefile for how PKG_CONFIG_PATH is set automatically.
+prefix=${pcfiledir}/..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libpipewire-0.3
+Description: PipeWire library (dev stub for build without libpipewire-0.3-dev)
+Version: 1.0.2
+Libs: -L${libdir} -lpipewire-0.3
+Cflags: -I${includedir}
