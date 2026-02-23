@@ -12,6 +12,7 @@ use crate::capture::{
 use crate::clipboard::ClipboardManager;
 use crate::error::{CaptureErrorKind, StructuredError};
 use crate::image_processor::{BlackImageDetector, CaptureInput, ImageProcessor, SelectionRegion};
+use crate::notification::{CaptureNotification, NotificationService};
 use crate::storage::{StorageError, StorageManager};
 
 /// Estado rico da state machine de captura com dados associados em cada variante.
@@ -407,6 +408,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             let is_black_warning = processed.is_black_warning;
             let width = processed.width;
             let height = processed.height;
+            let filename = processed.filename.clone();
             let rgba_bytes_for_clipboard = processed.rgba_bytes.clone();
 
             // Executa clipboard e file save em paralelo via tokio::join! + spawn_blocking.
@@ -441,6 +443,11 @@ impl<R: Runtime> CaptureOrchestrator<R> {
                 Ok(Ok(saved)) => saved,
                 Ok(Err(e)) => {
                     let error = Self::storage_err(e);
+                    if let Err(ne) =
+                        NotificationService::notify_error(&self.app_handle, &error.message)
+                    {
+                        tracing::warn!("notify_error failed (non-blocking): {}", ne);
+                    }
                     self.app_handle.emit("capture:error", error.clone()).ok();
                     let _ = self.transition(CaptureState::Failed {
                         error: error.clone(),
@@ -451,6 +458,11 @@ impl<R: Runtime> CaptureOrchestrator<R> {
                 Err(join_err) => {
                     let error =
                         StructuredError::internal(format!("file save task panicked: {}", join_err));
+                    if let Err(ne) =
+                        NotificationService::notify_error(&self.app_handle, &error.message)
+                    {
+                        tracing::warn!("notify_error failed (non-blocking): {}", ne);
+                    }
                     self.app_handle.emit("capture:error", error.clone()).ok();
                     self.state = CaptureState::Idle;
                     return Err(error);
@@ -482,6 +494,22 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             };
 
             self.app_handle.emit("capture:complete", result).ok();
+
+            // Emite notificação toast pós-captura (non-blocking: falha apenas registra warn).
+            let notification = CaptureNotification {
+                filename,
+                file_size_display: NotificationService::format_file_size(saved.file_size),
+                dir_path: saved
+                    .path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                is_warning: is_black_warning,
+            };
+            if let Err(e) = NotificationService::notify_capture(&self.app_handle, notification) {
+                tracing::warn!("notify_capture failed (non-blocking): {}", e);
+            }
+
             let _ = self.transition(CaptureState::Complete);
             let _ = self.transition(CaptureState::Idle);
         }
@@ -561,6 +589,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
         let is_black_warning = processed.is_black_warning;
         let width = processed.width;
         let height = processed.height;
+        let filename = processed.filename.clone();
         let rgba_bytes_for_clipboard = processed.rgba_bytes.clone();
 
         // Executa clipboard e file save em paralelo via tokio::join! + spawn_blocking.
@@ -597,6 +626,10 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             Ok(Ok(saved)) => saved,
             Ok(Err(e)) => {
                 let error = Self::storage_err(e);
+                if let Err(ne) = NotificationService::notify_error(&self.app_handle, &error.message)
+                {
+                    tracing::warn!("notify_error failed (non-blocking): {}", ne);
+                }
                 self.destroy_overlay_window().ok();
                 self.cleanup_temp_file(&temp_path);
                 self.app_handle.emit("capture:error", error.clone()).ok();
@@ -609,6 +642,10 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             Err(join_err) => {
                 let error =
                     StructuredError::internal(format!("file save task panicked: {}", join_err));
+                if let Err(ne) = NotificationService::notify_error(&self.app_handle, &error.message)
+                {
+                    tracing::warn!("notify_error failed (non-blocking): {}", ne);
+                }
                 self.destroy_overlay_window().ok();
                 self.cleanup_temp_file(&temp_path);
                 self.app_handle.emit("capture:error", error.clone()).ok();
@@ -647,6 +684,22 @@ impl<R: Runtime> CaptureOrchestrator<R> {
         self.app_handle
             .emit("capture:complete", result.clone())
             .ok();
+
+        // Emite notificação toast pós-captura (non-blocking: falha apenas registra warn).
+        let notification = CaptureNotification {
+            filename,
+            file_size_display: NotificationService::format_file_size(saved.file_size),
+            dir_path: saved
+                .path
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            is_warning: is_black_warning,
+        };
+        if let Err(e) = NotificationService::notify_capture(&self.app_handle, notification) {
+            tracing::warn!("notify_capture failed (non-blocking): {}", e);
+        }
+
         let _ = self.transition(CaptureState::Complete);
         let _ = self.transition(CaptureState::Idle);
 

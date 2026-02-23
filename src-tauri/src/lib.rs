@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod error;
 pub mod image_processor;
+pub mod notification;
 pub mod orchestrator;
 pub mod storage;
 
@@ -11,12 +12,14 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 use crate::capture::CaptureModeName;
+use crate::notification::NotificationService;
 use crate::orchestrator::CaptureOrchestrator;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .setup(|app| {
             // 1. Registrar CaptureOrchestrator como managed state.
@@ -24,7 +27,13 @@ pub fn run() {
                 Arc::new(Mutex::new(CaptureOrchestrator::new(app.handle().clone())));
             app.manage(orchestrator.clone());
 
-            // 2. Registrar global shortcut via plugin com handler.
+            // 2. Inicializar NotificationService (registra action types no mobile;
+            //    no desktop é no-op semântico).
+            if let Err(e) = NotificationService::setup(app.handle()) {
+                tracing::warn!("NotificationService::setup() failed (non-blocking): {}", e);
+            }
+
+            // 3. Registrar global shortcut via plugin com handler.
             // O plugin é registrado aqui (não no Builder) para ter acesso ao managed state.
             #[cfg(desktop)]
             {
