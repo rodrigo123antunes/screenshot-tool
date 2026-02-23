@@ -237,6 +237,181 @@ impl PlatformDirResolver {
 }
 
 // ============================================================
+// SelectionRegion
+// ============================================================
+
+/// Região de seleção para captura de área (mode Area/Region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+// ============================================================
+// CaptureInput
+// ============================================================
+
+/// Entrada do pipeline de processamento de imagem.
+pub struct CaptureInput {
+    /// Imagem bruta capturada.
+    pub image: RgbaImage,
+    /// Modo de captura (Fullscreen, Area, Window).
+    pub mode: CaptureModeName,
+    /// Região selecionada — presente apenas para mode=Area.
+    pub selection: Option<SelectionRegion>,
+    /// Flag do detector de imagem preta.
+    pub is_potentially_black: bool,
+}
+
+// ============================================================
+// ProcessedCapture
+// ============================================================
+
+/// Resultado do processamento de imagem: bytes PNG + metadados para gravação em disco.
+#[derive(Debug)]
+pub struct ProcessedCapture {
+    /// Bytes PNG codificados (sem I/O de disco — responsabilidade do StorageManager).
+    pub png_bytes: Vec<u8>,
+    /// Caminho completo de destino (diretório + filename).
+    pub target_path: PathBuf,
+    /// Nome do arquivo gerado (ex: `2026-02-23_14-35-22_region.png`).
+    pub filename: String,
+    /// Largura da imagem em pixels (pós-crop para mode Area).
+    pub width: u32,
+    /// Altura da imagem em pixels (pós-crop para mode Area).
+    pub height: u32,
+    /// `true` se a imagem foi detectada como possivelmente preta.
+    pub is_black_warning: bool,
+}
+
+// ============================================================
+// ImageProcessor
+// ============================================================
+
+/// Processa uma imagem capturada: crop condicional, naming, resolução de diretório e
+/// encoding PNG.  Não realiza I/O de disco — essa responsabilidade é do `StorageManager`.
+pub struct ImageProcessor;
+
+impl ImageProcessor {
+    /// Processa a imagem capturada e retorna um [`ProcessedCapture`] pronto para ser
+    /// gravado pelo `StorageManager`.
+    ///
+    /// # Pipeline
+    /// 1. Se `mode == Area`: valida bounds da [`SelectionRegion`] e aplica crop.
+    /// 2. Resolve o diretório de capturas via [`PlatformDirResolver::resolve()`].
+    /// 3. Gera o nome do arquivo via [`FileNameGenerator::generate()`].
+    /// 4. Codifica a imagem (possivelmente recortada) para bytes PNG.
+    /// 5. Retorna [`ProcessedCapture`] com todos os metadados.
+    pub fn process(input: CaptureInput) -> Result<ProcessedCapture, ImageProcessError> {
+        // 1. Crop condicional para mode Area
+        let final_image: RgbaImage = match input.mode {
+            CaptureModeName::Area => {
+                let region = input.selection.ok_or_else(|| {
+                    ImageProcessError::CropFailed(
+                        "SelectionRegion is required for Area mode but was None".to_string(),
+                    )
+                })?;
+
+                // Validar dimensões não-zero
+                if region.width == 0 || region.height == 0 {
+                    return Err(ImageProcessError::CropFailed(format!(
+                        "SelectionRegion dimensions must be > 0, got width={} height={}",
+                        region.width, region.height
+                    )));
+                }
+
+                let img_width = input.image.width();
+                let img_height = input.image.height();
+
+                // Verificar bounds: right e bottom não podem ultrapassar as dimensões da imagem
+                let right = region.x.checked_add(region.width).ok_or_else(|| {
+                    ImageProcessError::CropFailed(
+                        "SelectionRegion x + width overflow u32".to_string(),
+                    )
+                })?;
+                let bottom = region.y.checked_add(region.height).ok_or_else(|| {
+                    ImageProcessError::CropFailed(
+                        "SelectionRegion y + height overflow u32".to_string(),
+                    )
+                })?;
+
+                if right > img_width || bottom > img_height {
+                    return Err(ImageProcessError::CropFailed(format!(
+                        "SelectionRegion (x={}, y={}, {}x{}) is out of image bounds ({}x{})",
+                        region.x, region.y, region.width, region.height, img_width, img_height,
+                    )));
+                }
+
+                tracing::debug!(
+                    x = region.x,
+                    y = region.y,
+                    width = region.width,
+                    height = region.height,
+                    "Applying crop for Area mode"
+                );
+
+                image::imageops::crop_imm(
+                    &input.image,
+                    region.x,
+                    region.y,
+                    region.width,
+                    region.height,
+                )
+                .to_image()
+            }
+            // Fullscreen e Window: sem crop — usa imagem original
+            CaptureModeName::Fullscreen | CaptureModeName::Window => input.image,
+        };
+
+        // 2. Resolver diretório de capturas por plataforma
+        let target_dir = PlatformDirResolver::resolve()
+            .map_err(|e| ImageProcessError::DirResolveFailed(e.to_string()))?;
+
+        // 3. Gerar nome de arquivo seguindo a convenção YYYY-MM-DD_HH-MM-SS_mode.png
+        let filename = FileNameGenerator::generate(&input.mode, &target_dir, "png")?;
+
+        // 4. Codificar imagem para bytes PNG (sem I/O de disco)
+        let width = final_image.width();
+        let height = final_image.height();
+
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(final_image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .map_err(|e| ImageProcessError::EncodeFailed(e.to_string()))?;
+
+        // 5. Compor caminho de destino completo
+        let target_path = target_dir.join(&filename);
+
+        let crop_applied = matches!(input.mode, CaptureModeName::Area);
+        tracing::info!(
+            filename = %filename,
+            width = width,
+            height = height,
+            crop_applied = crop_applied,
+            "Image processing complete"
+        );
+        tracing::debug!(
+            crop_applied = crop_applied,
+            "Crop applied flag for processed capture"
+        );
+
+        Ok(ProcessedCapture {
+            png_bytes,
+            target_path,
+            filename,
+            width,
+            height,
+            is_black_warning: input.is_potentially_black,
+        })
+    }
+}
+
+// ============================================================
 // Testes
 // ============================================================
 
@@ -583,6 +758,260 @@ mod tests {
         assert!(
             matches!(result, Err(DirResolveError::NoPlatformDir)),
             "Deve retornar DirResolveError::NoPlatformDir quando ambos os dirs são None"
+        );
+    }
+
+    // -------------------------
+    // Testes do ImageProcessor::process()
+    // -------------------------
+
+    #[test]
+    fn process_region_mode_crops_to_selection_dimensions() {
+        let image = all_white_image(100, 100);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Area,
+            selection: Some(SelectionRegion {
+                x: 10,
+                y: 10,
+                width: 50,
+                height: 40,
+            }),
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        assert_eq!(result.width, 50, "Largura deve ser 50 após crop");
+        assert_eq!(result.height, 40, "Altura deve ser 40 após crop");
+    }
+
+    #[test]
+    fn process_fullscreen_mode_preserves_original_dimensions() {
+        let image = all_white_image(200, 150);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Fullscreen,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        assert_eq!(result.width, 200, "Largura deve ser 200 sem crop");
+        assert_eq!(result.height, 150, "Altura deve ser 150 sem crop");
+    }
+
+    #[test]
+    fn process_window_mode_preserves_original_dimensions() {
+        let image = all_white_image(200, 150);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Window,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        assert_eq!(
+            result.width, 200,
+            "Largura deve ser 200 sem crop (Window mode)"
+        );
+        assert_eq!(
+            result.height, 150,
+            "Altura deve ser 150 sem crop (Window mode)"
+        );
+    }
+
+    #[test]
+    fn process_region_out_of_bounds_returns_crop_failed() {
+        // Imagem 100x100, seleção x=90, y=90, width=50, height=50 → right=140, bottom=140 → fora dos bounds
+        let image = all_white_image(100, 100);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Area,
+            selection: Some(SelectionRegion {
+                x: 90,
+                y: 90,
+                width: 50,
+                height: 50,
+            }),
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input);
+        assert!(
+            matches!(result, Err(ImageProcessError::CropFailed(_))),
+            "Seleção fora dos bounds deve retornar CropFailed, obtido: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn process_region_width_zero_returns_crop_failed() {
+        let image = all_white_image(100, 100);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Area,
+            selection: Some(SelectionRegion {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 50,
+            }),
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input);
+        assert!(
+            matches!(result, Err(ImageProcessError::CropFailed(_))),
+            "width=0 deve retornar CropFailed, obtido: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn process_png_bytes_are_valid_png() {
+        let image = all_white_image(50, 50);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Fullscreen,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        let decoded = image::load_from_memory(&result.png_bytes);
+        assert!(
+            decoded.is_ok(),
+            "png_bytes deve ser um PNG válido: {:?}",
+            decoded.err()
+        );
+    }
+
+    #[test]
+    fn process_is_black_warning_propagated() {
+        let image = all_black_image(50, 50);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Fullscreen,
+            selection: None,
+            is_potentially_black: true,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        assert!(
+            result.is_black_warning,
+            "is_black_warning deve ser true quando is_potentially_black=true"
+        );
+    }
+
+    #[test]
+    fn process_is_black_warning_false_when_not_set() {
+        let image = all_white_image(50, 50);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Fullscreen,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+        assert!(
+            !result.is_black_warning,
+            "is_black_warning deve ser false quando is_potentially_black=false"
+        );
+    }
+
+    #[test]
+    fn process_filename_follows_naming_convention() {
+        // Area mode → deve conter "_region.png"
+        let image_area = all_white_image(80, 80);
+        let input_area = CaptureInput {
+            image: image_area,
+            mode: CaptureModeName::Area,
+            selection: Some(SelectionRegion {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 80,
+            }),
+            is_potentially_black: false,
+        };
+        let result_area = ImageProcessor::process(input_area).expect("deve processar Area");
+        assert!(
+            result_area.filename.contains("_region.png"),
+            "Filename para Area mode deve conter '_region.png', obtido: {}",
+            result_area.filename
+        );
+
+        // Fullscreen mode → deve conter "_fullscreen.png"
+        let image_full = all_white_image(80, 80);
+        let input_full = CaptureInput {
+            image: image_full,
+            mode: CaptureModeName::Fullscreen,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result_full = ImageProcessor::process(input_full).expect("deve processar Fullscreen");
+        assert!(
+            result_full.filename.contains("_fullscreen.png"),
+            "Filename para Fullscreen mode deve conter '_fullscreen.png', obtido: {}",
+            result_full.filename
+        );
+    }
+
+    #[test]
+    fn process_target_path_equals_dir_plus_filename() {
+        let image = all_white_image(60, 60);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Window,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input).expect("deve processar sem erro");
+
+        // target_path deve ser igual ao diretório pai concatenado com o filename
+        let expected = result
+            .target_path
+            .parent()
+            .expect("target_path deve ter diretório pai")
+            .join(&result.filename);
+
+        assert_eq!(
+            result.target_path, expected,
+            "target_path deve ser igual a parent_dir.join(filename)"
+        );
+    }
+
+    #[test]
+    fn process_region_height_zero_returns_crop_failed() {
+        let image = all_white_image(100, 100);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Area,
+            selection: Some(SelectionRegion {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 0,
+            }),
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input);
+        assert!(
+            matches!(result, Err(ImageProcessError::CropFailed(_))),
+            "height=0 deve retornar CropFailed, obtido: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn process_region_mode_with_no_selection_returns_crop_failed() {
+        // Area mode com selection=None deve retornar CropFailed (seleção obrigatória)
+        let image = all_white_image(100, 100);
+        let input = CaptureInput {
+            image,
+            mode: CaptureModeName::Area,
+            selection: None,
+            is_potentially_black: false,
+        };
+        let result = ImageProcessor::process(input);
+        assert!(
+            matches!(result, Err(ImageProcessError::CropFailed(_))),
+            "Area mode com selection=None deve retornar CropFailed, obtido: {:?}",
+            result
         );
     }
 }
