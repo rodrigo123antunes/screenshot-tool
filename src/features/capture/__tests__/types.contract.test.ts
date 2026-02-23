@@ -45,14 +45,31 @@ describe("Capture types contracts", () => {
       height: 200,
     };
     const result: CaptureResult = {
-      file_path: "/home/user/Screenshots/screenshot.png",
-      clipboard_success: true,
+      path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_region.png",
+      width: 320,
+      height: 200,
+      file_size: 245760,
+      is_black_warning: false,
     };
 
     expect(region.width).toBeGreaterThan(0);
     expect(region.height).toBeGreaterThan(0);
-    expect(result.file_path).toContain(".png");
-    expect(result.clipboard_success).toBe(true);
+    expect(result.path).toContain(".png");
+    expect(result.width).toBe(320);
+    expect(result.height).toBe(200);
+    expect(result.file_size).toBeGreaterThan(0);
+    expect(result.is_black_warning).toBe(false);
+  });
+
+  it("mantem CaptureResult com campo is_black_warning como boolean", () => {
+    const warningResult: CaptureResult = {
+      path: "/tmp/test_black.png",
+      width: 1920,
+      height: 1080,
+      file_size: 512000,
+      is_black_warning: true,
+    };
+    expect(warningResult.is_black_warning).toBe(true);
   });
 
   it("aceita apenas modos de captura canonicos", () => {

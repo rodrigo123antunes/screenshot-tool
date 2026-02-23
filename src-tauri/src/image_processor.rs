@@ -274,6 +274,8 @@ pub struct CaptureInput {
 pub struct ProcessedCapture {
     /// Bytes PNG codificados (sem I/O de disco — responsabilidade do StorageManager).
     pub png_bytes: Vec<u8>,
+    /// Pixels RGBA brutos (interleaved R,G,B,A) — usados pelo ClipboardManager.
+    pub rgba_bytes: Vec<u8>,
     /// Caminho completo de destino (diretório + filename).
     pub target_path: PathBuf,
     /// Nome do arquivo gerado (ex: `2026-02-23_14-35-22_region.png`).
@@ -372,10 +374,12 @@ impl ImageProcessor {
         // 3. Gerar nome de arquivo seguindo a convenção YYYY-MM-DD_HH-MM-SS_mode.png
         let filename = FileNameGenerator::generate(&input.mode, &target_dir, "png")?;
 
-        // 4. Codificar imagem para bytes PNG (sem I/O de disco)
+        // 4. Capturar metadados e pixels RGBA brutos antes do encoding
         let width = final_image.width();
         let height = final_image.height();
+        let rgba_bytes = final_image.as_raw().to_vec();
 
+        // Codificar imagem para bytes PNG (sem I/O de disco)
         let mut png_bytes = Vec::new();
         image::DynamicImage::ImageRgba8(final_image)
             .write_to(
@@ -402,6 +406,7 @@ impl ImageProcessor {
 
         Ok(ProcessedCapture {
             png_bytes,
+            rgba_bytes,
             target_path,
             filename,
             width,

@@ -59,8 +59,11 @@ describe("captureCommands", () => {
     it("chama invoke com região correta e retorna CaptureResult", async () => {
       const region: Region = { x: 10, y: 20, width: 300, height: 200 };
       const captureResult: CaptureResult = {
-        file_path: "/home/user/Screenshots/screenshot.png",
-        clipboard_success: true,
+        path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_region.png",
+        width: 300,
+        height: 200,
+        file_size: 245760,
+        is_black_warning: false,
       };
       mockInvoke.mockResolvedValueOnce(captureResult);
 

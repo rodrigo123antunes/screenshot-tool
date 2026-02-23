@@ -2,7 +2,7 @@ use crate::error::{CaptureError, CaptureErrorKind};
 use crate::image_processor::ProcessedCapture;
 use image::RgbaImage;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ============================================================
 // StorageError
@@ -113,74 +113,6 @@ impl StorageManager {
         })?;
         Ok(path)
     }
-
-    /// Salva a imagem como PNG em `~/Screenshots/screenshot-tool/`.
-    ///
-    /// # Depreciado
-    ///
-    /// Use [`StorageManager::save`] com [`ProcessedCapture`] em vez disso.
-    /// Mantido temporariamente até que o `CaptureOrchestrator` seja atualizado na step 5.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Use StorageManager::save(ProcessedCapture) instead. Will be removed when CaptureOrchestrator is updated in step 5."
-    )]
-    pub fn save_screenshot(image: &RgbaImage) -> Result<PathBuf, CaptureError> {
-        let dir = Self::screenshots_dir_impl()?;
-        Self::save_to_dir(image, &dir)
-    }
-
-    // --- Helpers internos para os métodos depreciados ---
-
-    fn screenshots_dir_impl() -> Result<PathBuf, CaptureError> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            CaptureError::new(CaptureErrorKind::StorageError)
-                .with_context("Home directory not found")
-        })?;
-        let dir = home.join("Screenshots").join("screenshot-tool");
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            CaptureError::new(CaptureErrorKind::StorageError)
-                .with_context(format!("Failed to create directory {:?}: {}", dir, e))
-        })?;
-        Ok(dir)
-    }
-
-    fn save_to_dir(image: &RgbaImage, dir: &Path) -> Result<PathBuf, CaptureError> {
-        let timestamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let filename = format!("Screenshot_{}.png", timestamp);
-        let path = dir.join(&filename);
-        let final_path = Self::resolve_collision(path);
-        image.save(&final_path).map_err(|e| {
-            CaptureError::new(CaptureErrorKind::StorageError).with_context(format!(
-                "Failed to save screenshot to {:?}: {}",
-                final_path, e
-            ))
-        })?;
-        Ok(final_path)
-    }
-
-    fn resolve_collision(base_path: PathBuf) -> PathBuf {
-        if !base_path.exists() {
-            return base_path;
-        }
-        let stem = base_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let ext = base_path
-            .extension()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        let parent = base_path.parent().unwrap_or(Path::new("."));
-        for i in 1u64.. {
-            let candidate = parent.join(format!("{}_{}.{}", stem, i, ext));
-            if !candidate.exists() {
-                return candidate;
-            }
-        }
-        unreachable!("Cannot find non-colliding path after u64::MAX attempts")
-    }
 }
 
 #[cfg(test)]
@@ -214,8 +146,10 @@ mod tests {
 
     /// Cria um `ProcessedCapture` mínimo para os testes de `save()`.
     fn make_processed_capture(target_path: PathBuf) -> ProcessedCapture {
+        let image = RgbaImage::new(2, 2);
         ProcessedCapture {
             png_bytes: minimal_png_bytes(),
+            rgba_bytes: image.as_raw().to_vec(),
             target_path,
             filename: "test_2x2.png".to_string(),
             width: 2,
@@ -278,6 +212,7 @@ mod tests {
         let expected_size = png_bytes.len() as u64;
         let processed = ProcessedCapture {
             png_bytes,
+            rgba_bytes: RgbaImage::new(2, 2).as_raw().to_vec(),
             target_path: path.clone(),
             filename: "test.png".to_string(),
             width: 2,
@@ -301,6 +236,7 @@ mod tests {
         let expected_bytes = png_bytes.clone();
         let processed = ProcessedCapture {
             png_bytes,
+            rgba_bytes: RgbaImage::new(2, 2).as_raw().to_vec(),
             target_path: path.clone(),
             filename: "test.png".to_string(),
             width: 2,

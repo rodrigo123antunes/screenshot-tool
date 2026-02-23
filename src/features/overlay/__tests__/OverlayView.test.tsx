@@ -161,8 +161,11 @@ describe("OverlayView", () => {
 
   it("evento capture:complete aciona efeito de flash", async () => {
     const completeResult: CaptureResult = {
-      file_path: "/home/user/Screenshots/screenshot.png",
-      clipboard_success: true,
+      path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_fullscreen.png",
+      width: 1920,
+      height: 1080,
+      file_size: 1024000,
+      is_black_warning: false,
     };
 
     const capturedHandlers: Record<string, EventHandler> = {};

@@ -66,8 +66,11 @@ describe("useCaptureEvents", () => {
   it("chama onComplete com CaptureResult quando evento capture:complete é emitido", async () => {
     const onComplete = vi.fn();
     const captureResult: CaptureResult = {
-      file_path: "/home/user/Screenshots/screenshot.png",
-      clipboard_success: true,
+      path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_fullscreen.png",
+      width: 1920,
+      height: 1080,
+      file_size: 1024000,
+      is_black_warning: false,
     };
 
     const capturedHandlers: Record<string, EventHandler> = {};

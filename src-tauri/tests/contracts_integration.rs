@@ -123,10 +123,24 @@ fn should_serialize_enums_using_stable_wire_format() {
     assert_eq!(state, "\"freeze_ready\"");
 
     let result = CaptureResult {
-        file_path: "/tmp/final.png".to_string(),
-        clipboard_success: false,
+        path: "/tmp/final.png".to_string(),
+        width: 1920,
+        height: 1080,
+        file_size: 245760,
+        is_black_warning: false,
     };
     let value = serde_json::to_value(&result).expect("must serialize");
-    assert!(value.get("file_path").is_some());
-    assert!(value.get("clipboard_success").is_some());
+    assert!(value.get("path").is_some());
+    assert!(value.get("width").is_some());
+    assert!(value.get("height").is_some());
+    assert!(value.get("file_size").is_some());
+    assert!(value.get("is_black_warning").is_some());
+    assert!(
+        value.get("file_path").is_none(),
+        "deprecated field must not exist"
+    );
+    assert!(
+        value.get("clipboard_success").is_none(),
+        "deprecated field must not exist"
+    );
 }

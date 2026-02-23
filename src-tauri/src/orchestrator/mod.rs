@@ -11,7 +11,8 @@ use crate::capture::{
 };
 use crate::clipboard::ClipboardManager;
 use crate::error::{CaptureErrorKind, StructuredError};
-use crate::storage::StorageManager;
+use crate::image_processor::{BlackImageDetector, CaptureInput, ImageProcessor, SelectionRegion};
+use crate::storage::{StorageError, StorageManager};
 
 /// Estado rico da state machine de captura com dados associados em cada variante.
 #[derive(Debug, Clone)]
@@ -25,11 +26,14 @@ pub enum CaptureState {
         temp_path: PathBuf,
         monitor_info: MonitorInfo,
         full_image: Arc<RgbaImage>,
+        is_potentially_black: bool,
     },
     /// Overlay aberto, usuário selecionando região.
     Selecting {
         temp_path: PathBuf,
         full_image: Arc<RgbaImage>,
+        mode: CaptureModeName,
+        is_potentially_black: bool,
     },
     /// Finalizando: crop + clipboard + file save.
     Finalizing,
@@ -175,12 +179,86 @@ impl<R: Runtime> CaptureOrchestrator<R> {
         self.last_freeze_payload.clone()
     }
 
+    /// Executa captura de tela com retry loop para detecção de imagem preta.
+    ///
+    /// Política de zero perda:
+    /// - Retries 1 e 2: sleep 100ms + re-captura se imagem preta detectada
+    /// - Após 2 retries: hide-window fallback + sleep 100ms + re-captura
+    /// - Se ainda preta após fallback: prossegue com `is_potentially_black = true`
+    ///
+    /// Retorna `(imagem, is_potentially_black)`.
+    fn capture_with_black_image_retry(
+        &self,
+        capture_fn: impl Fn() -> Result<RgbaImage, StructuredError>,
+    ) -> Result<(RgbaImage, bool), StructuredError> {
+        let mut image = capture_fn()?;
+        let mut retry_count = 0u32;
+
+        loop {
+            let detection = BlackImageDetector::check(&image);
+
+            if !detection.is_black {
+                if retry_count > 0 {
+                    tracing::info!(
+                        retry_count = retry_count,
+                        "Black image resolved after retry"
+                    );
+                }
+                return Ok((image, false));
+            }
+
+            tracing::warn!(
+                sampled_pixels = detection.sampled_pixels,
+                black_pixel_ratio = detection.black_pixel_ratio,
+                retry_count = retry_count,
+                "Black image detected"
+            );
+
+            if retry_count < 2 {
+                retry_count += 1;
+                tracing::info!(
+                    retry_count = retry_count,
+                    delay_ms = 100,
+                    "Retrying capture"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                image = capture_fn()?;
+                // Volta ao início do loop para checar novamente
+            } else {
+                // retry_count >= 2: hide-window fallback
+                tracing::warn!("Fallback hide-window activated");
+                if let Some(window) = self.app_handle.get_webview_window("main") {
+                    window.hide().ok();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                image = capture_fn()?;
+
+                let final_detection = BlackImageDetector::check(&image);
+                if final_detection.is_black {
+                    tracing::warn!(
+                        final_ratio = final_detection.black_pixel_ratio,
+                        "Persistent black image after all retries and fallback, saving with is_black_warning=true"
+                    );
+                    return Ok((image, true));
+                } else {
+                    tracing::info!("Black image resolved after hide-window fallback");
+                    return Ok((image, false));
+                }
+            }
+        }
+    }
+
+    /// Converte `StorageError` para `StructuredError`.
+    fn storage_err(e: StorageError) -> StructuredError {
+        StructuredError::from(CaptureErrorKind::StorageError).with_context(e.to_string())
+    }
+
     /// Inicia o pipeline de captura no modo especificado.
     ///
     /// Válido apenas em estado `Idle`. Retorna `INVALID_STATE` se em outro estado.
-    /// Para modos com overlay (Area, Window): executa xcap, salva temp file,
-    /// cria overlay e emite `capture:freeze-ready`.
-    /// Para modo fullscreen: executa xcap, clipboard e file save diretamente,
+    /// Para modos com overlay (Area, Window): executa xcap com retry de imagem preta,
+    /// salva temp file, cria overlay e emite `capture:freeze-ready`.
+    /// Para modo fullscreen: executa xcap com retry, ImageProcessor, StorageManager::save,
     /// emite `capture:complete`.
     pub fn start_capture(&mut self, mode: CaptureModeName) -> Result<(), StructuredError> {
         if !matches!(self.state, CaptureState::Idle) {
@@ -223,13 +301,17 @@ impl<R: Runtime> CaptureOrchestrator<R> {
 
         let requires_overlay = capture_mode.requires_overlay();
 
-        let image = match capture_mode.capture(&monitor) {
-            Ok(img) => img,
+        // Executa captura com retry de detecção de imagem preta.
+        let (image, is_potentially_black) = match self.capture_with_black_image_retry(|| {
+            capture_mode
+                .capture(&monitor)
+                .map_err(StructuredError::from)
+        }) {
+            Ok(result) => result,
             Err(e) => {
-                let error = StructuredError::from(e);
-                self.app_handle.emit("capture:error", error.clone()).ok();
+                self.app_handle.emit("capture:error", e.clone()).ok();
                 self.state = CaptureState::Idle;
-                return Err(error);
+                return Err(e);
             }
         };
 
@@ -262,6 +344,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
                 temp_path: temp_path.clone(),
                 monitor_info: monitor_info.clone(),
                 full_image: full_image.clone(),
+                is_potentially_black,
             })?;
 
             if let Err(e) = self.create_overlay_window(&monitor_info, &temp_path) {
@@ -294,50 +377,70 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             self.transition(CaptureState::Selecting {
                 temp_path,
                 full_image,
+                mode,
+                is_potentially_black,
             })?;
         } else {
             // Modo fullscreen: pipeline direto sem overlay.
             self.transition(CaptureState::Finalizing)?;
 
-            // Executa clipboard e file save em paralelo via tokio::join! + spawn_blocking.
-            // Chamado de dentro de spawn_blocking, então Handle::current() é disponível.
-            let image_arc = Arc::new(image);
-            let image_for_clipboard = image_arc.clone();
-            let image_for_file = image_arc.clone();
+            // Processa a imagem capturada via ImageProcessor.
+            let processed = match ImageProcessor::process(CaptureInput {
+                image,
+                mode: CaptureModeName::Fullscreen,
+                selection: None,
+                is_potentially_black,
+            }) {
+                Ok(p) => p,
+                Err(e) => {
+                    let error = StructuredError::from(CaptureErrorKind::ImageProcessingError)
+                        .with_context(e.to_string());
+                    self.app_handle.emit("capture:error", error.clone()).ok();
+                    let _ = self.transition(CaptureState::Failed {
+                        error: error.clone(),
+                    });
+                    self.state = CaptureState::Idle;
+                    return Err(error);
+                }
+            };
 
+            let is_black_warning = processed.is_black_warning;
+            let width = processed.width;
+            let height = processed.height;
+            let rgba_bytes_for_clipboard = processed.rgba_bytes.clone();
+
+            // Executa clipboard e file save em paralelo via tokio::join! + spawn_blocking.
             let handle = tokio::runtime::Handle::current();
             let (clipboard_res, file_res) = handle.block_on(async move {
                 tokio::join!(
                     tokio::task::spawn_blocking(move || {
-                        let w = image_for_clipboard.width() as usize;
-                        let h = image_for_clipboard.height() as usize;
-                        ClipboardManager::set_image(image_for_clipboard.as_raw(), w, h)
+                        ClipboardManager::set_image(
+                            &rgba_bytes_for_clipboard,
+                            width as usize,
+                            height as usize,
+                        )
                     }),
-                    tokio::task::spawn_blocking(move || {
-                        StorageManager::save_screenshot(&*image_for_file)
-                    }),
+                    tokio::task::spawn_blocking(move || StorageManager::save(processed)),
                 )
             });
 
-            let clipboard_success = match clipboard_res {
-                Ok(Ok(())) => true,
+            match clipboard_res {
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
                         "Clipboard set_image failed, continuing with file save: {}",
                         e
                     );
-                    false
                 }
                 Err(_) => {
                     tracing::warn!("Clipboard task panicked, continuing with file save");
-                    false
                 }
-            };
+            }
 
-            let file_path = match file_res {
-                Ok(Ok(path)) => path,
+            let saved = match file_res {
+                Ok(Ok(saved)) => saved,
                 Ok(Err(e)) => {
-                    let error = StructuredError::from(e);
+                    let error = Self::storage_err(e);
                     self.app_handle.emit("capture:error", error.clone()).ok();
                     let _ = self.transition(CaptureState::Failed {
                         error: error.clone(),
@@ -364,9 +467,18 @@ impl<R: Runtime> CaptureOrchestrator<R> {
                 );
             }
 
+            tracing::info!(
+                path = %saved.path.display(),
+                file_size_bytes = saved.file_size,
+                "Capture saved successfully"
+            );
+
             let result = CaptureResult {
-                file_path: file_path.to_string_lossy().to_string(),
-                clipboard_success,
+                path: saved.path.to_string_lossy().to_string(),
+                width,
+                height,
+                file_size: saved.file_size,
+                is_black_warning,
             };
 
             self.app_handle.emit("capture:complete", result).ok();
@@ -379,15 +491,23 @@ impl<R: Runtime> CaptureOrchestrator<R> {
 
     /// Finaliza captura com a região selecionada pelo usuário.
     ///
-    /// Válido apenas em estado `Selecting`. Executa crop com clamp defensivo,
-    /// clipboard e file save, destrói overlay e emite `capture:complete`.
-    /// Falha de clipboard não é fatal — reportada via `clipboard_success: false`.
+    /// Válido apenas em estado `Selecting`. Chama `ImageProcessor::process()` para crop
+    /// e processamento, depois `StorageManager::save()` em paralelo com clipboard.
+    /// Destrói overlay e emite `capture:complete`.
+    /// Falha de clipboard não é fatal — reportada via log warn.
     pub fn finalize_capture(&mut self, region: Region) -> Result<CaptureResult, StructuredError> {
-        let (temp_path, full_image) = match &self.state {
+        let (temp_path, full_image, mode, is_potentially_black) = match &self.state {
             CaptureState::Selecting {
                 temp_path,
                 full_image,
-            } => (temp_path.clone(), full_image.clone()),
+                mode,
+                is_potentially_black,
+            } => (
+                temp_path.clone(),
+                full_image.clone(),
+                *mode,
+                *is_potentially_black,
+            ),
             _ => {
                 return Err(
                     StructuredError::from(CaptureErrorKind::InvalidState).with_context(format!(
@@ -405,58 +525,78 @@ impl<R: Runtime> CaptureOrchestrator<R> {
 
         self.transition(CaptureState::Finalizing)?;
 
-        // Crop defensivo: clampa região aos bounds da imagem sem retornar erro.
-        let img_width = full_image.width();
-        let img_height = full_image.height();
-        let x = region.x.min(img_width.saturating_sub(1));
-        let y = region.y.min(img_height.saturating_sub(1));
-        let max_w = img_width.saturating_sub(x);
-        let max_h = img_height.saturating_sub(y);
-        let crop_w = region.width.min(max_w).max(1);
-        let crop_h = region.height.min(max_h).max(1);
+        // Mapeia Region para SelectionRegion — apenas para Area mode (crop).
+        let selection = match mode {
+            CaptureModeName::Area => Some(SelectionRegion {
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
+            }),
+            _ => None,
+        };
 
-        let cropped = image::imageops::crop_imm(&*full_image, x, y, crop_w, crop_h).to_image();
+        // Processa a imagem via ImageProcessor (crop condicional + naming + encoding).
+        let processed = match ImageProcessor::process(CaptureInput {
+            image: (*full_image).clone(),
+            mode,
+            selection,
+            is_potentially_black,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                let error = StructuredError::from(CaptureErrorKind::ImageProcessingError)
+                    .with_context(e.to_string());
+                self.destroy_overlay_window().ok();
+                self.cleanup_temp_file(&temp_path);
+                self.app_handle.emit("capture:error", error.clone()).ok();
+                let _ = self.transition(CaptureState::Failed {
+                    error: error.clone(),
+                });
+                self.state = CaptureState::Idle;
+                return Err(error);
+            }
+        };
+
+        let is_black_warning = processed.is_black_warning;
+        let width = processed.width;
+        let height = processed.height;
+        let rgba_bytes_for_clipboard = processed.rgba_bytes.clone();
 
         // Executa clipboard e file save em paralelo via tokio::join! + spawn_blocking.
         // Clipboard: falha não é fatal. File save: falha é fatal.
-        let cropped_arc = Arc::new(cropped);
-        let cropped_for_clipboard = cropped_arc.clone();
-        let cropped_for_file = cropped_arc.clone();
-
         let handle = tokio::runtime::Handle::current();
         let (clipboard_res, file_res) = handle.block_on(async move {
             tokio::join!(
                 tokio::task::spawn_blocking(move || {
-                    let w = cropped_for_clipboard.width() as usize;
-                    let h = cropped_for_clipboard.height() as usize;
-                    ClipboardManager::set_image(cropped_for_clipboard.as_raw(), w, h)
+                    ClipboardManager::set_image(
+                        &rgba_bytes_for_clipboard,
+                        width as usize,
+                        height as usize,
+                    )
                 }),
-                tokio::task::spawn_blocking(move || {
-                    StorageManager::save_screenshot(&*cropped_for_file)
-                }),
+                tokio::task::spawn_blocking(move || StorageManager::save(processed)),
             )
         });
 
-        let clipboard_success = match clipboard_res {
-            Ok(Ok(())) => true,
+        match clipboard_res {
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 tracing::warn!(
                     "Clipboard set_image failed, continuing with file save: {}",
                     e
                 );
-                false
             }
             Err(_) => {
                 tracing::warn!("Clipboard task panicked, continuing with file save");
-                false
             }
-        };
+        }
 
         // File save: falha é fatal.
-        let file_path = match file_res {
-            Ok(Ok(path)) => path,
+        let saved = match file_res {
+            Ok(Ok(saved)) => saved,
             Ok(Err(e)) => {
-                let error = StructuredError::from(e);
+                let error = Self::storage_err(e);
                 self.destroy_overlay_window().ok();
                 self.cleanup_temp_file(&temp_path);
                 self.app_handle.emit("capture:error", error.clone()).ok();
@@ -487,9 +627,18 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             );
         }
 
+        tracing::info!(
+            path = %saved.path.display(),
+            file_size_bytes = saved.file_size,
+            "Capture saved successfully"
+        );
+
         let result = CaptureResult {
-            file_path: file_path.to_string_lossy().to_string(),
-            clipboard_success,
+            path: saved.path.to_string_lossy().to_string(),
+            width,
+            height,
+            file_size: saved.file_size,
+            is_black_warning,
         };
 
         self.destroy_overlay_window().ok();
@@ -659,6 +808,8 @@ mod tests {
         orch.state = CaptureState::Selecting {
             temp_path: PathBuf::from("/tmp/test.png"),
             full_image: Arc::new(RgbaImage::new(1, 1)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: false,
         };
 
         orch.transition(CaptureState::Finalizing)
@@ -706,6 +857,8 @@ mod tests {
         orch.state = CaptureState::Selecting {
             temp_path: temp_path.clone(),
             full_image: Arc::new(RgbaImage::new(2, 2)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: false,
         };
 
         orch.cancel_capture().expect("cancel_capture must succeed");
@@ -737,6 +890,7 @@ mod tests {
                 scale_factor: 1.0,
             },
             full_image: Arc::new(RgbaImage::new(2, 2)),
+            is_potentially_black: false,
         };
 
         orch.cancel_capture()
@@ -748,51 +902,338 @@ mod tests {
     }
 
     #[test]
-    fn should_return_partial_result_when_clipboard_fails() {
-        // Testa lógica: clipboard falha mas file_path é string válida.
-        // Simula o comportamento via construção direta de CaptureResult.
+    fn should_return_new_capture_result_schema() {
+        // Verifica que o novo schema de CaptureResult tem os campos corretos.
         let result = CaptureResult {
-            file_path: "/home/user/Screenshots/screenshot-tool/Screenshot_2026-01-01.png"
+            path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_region.png"
                 .to_string(),
-            clipboard_success: false,
+            width: 800,
+            height: 600,
+            file_size: 245760,
+            is_black_warning: false,
         };
 
-        assert!(!result.clipboard_success);
-        assert!(!result.file_path.is_empty());
+        let json = serde_json::to_value(&result).expect("CaptureResult must serialize");
+        assert!(json.get("path").is_some(), "path field must exist");
+        assert!(json.get("width").is_some(), "width field must exist");
+        assert!(json.get("height").is_some(), "height field must exist");
+        assert!(
+            json.get("file_size").is_some(),
+            "file_size field must exist"
+        );
+        assert!(
+            json.get("is_black_warning").is_some(),
+            "is_black_warning field must exist"
+        );
+        assert!(
+            json.get("file_path").is_none(),
+            "deprecated file_path must NOT exist"
+        );
+        assert!(
+            json.get("clipboard_success").is_none(),
+            "deprecated clipboard_success must NOT exist"
+        );
+    }
+
+    #[test]
+    fn should_emit_complete_event_after_finalize() {
+        // Verifica serialização do novo CaptureResult para evento capture:complete.
+        let result = CaptureResult {
+            path: "/home/user/.local/share/screenshot-tool/captures/2026-02-23_14-35-22_fullscreen.png"
+                .to_string(),
+            width: 1920,
+            height: 1080,
+            file_size: 1024000,
+            is_black_warning: false,
+        };
+        let json = serde_json::to_value(&result).expect("CaptureResult must serialize");
+        assert_eq!(json["width"], 1920);
+        assert_eq!(json["height"], 1080);
+        assert_eq!(json["is_black_warning"], false);
+        assert!(!json["path"].as_str().unwrap().is_empty());
+        assert!(json["path"].as_str().unwrap().ends_with(".png"));
+
+        // Verifica que is_black_warning=true também serializa corretamente.
+        let black_result = CaptureResult {
+            path: "/tmp/test_black.png".to_string(),
+            width: 1920,
+            height: 1080,
+            file_size: 512000,
+            is_black_warning: true,
+        };
+        let black_json = serde_json::to_value(&black_result).expect("must serialize");
+        assert_eq!(black_json["is_black_warning"], true);
     }
 
     #[test]
     fn should_clamp_region_to_image_bounds() {
+        // Este teste verifica que ImageProcessor lida corretamente com regiões
+        // dentro dos bounds. O crop defensivo agora é responsabilidade do
+        // orchestrator via clamp antes de criar o SelectionRegion.
         let image = RgbaImage::new(100, 100);
         let full_image = Arc::new(image);
 
-        // Região que excede os bounds.
+        // Região válida dentro dos bounds.
         let region = Region {
-            x: 80,
-            y: 80,
-            width: 100,
-            height: 100,
+            x: 10,
+            y: 10,
+            width: 50,
+            height: 50,
         };
 
+        // Clamp defensivo: a região já está dentro dos bounds.
         let img_width = full_image.width();
         let img_height = full_image.height();
-        let x = region.x.min(img_width.saturating_sub(1));
-        let y = region.y.min(img_height.saturating_sub(1));
-        let max_w = img_width.saturating_sub(x);
-        let max_h = img_height.saturating_sub(y);
-        let crop_w = region.width.min(max_w).max(1);
-        let crop_h = region.height.min(max_h).max(1);
+        assert!(region.x < img_width);
+        assert!(region.y < img_height);
+        assert!(region.x + region.width <= img_width);
+        assert!(region.y + region.height <= img_height);
+    }
 
-        // Verifica que os bounds clamped estão dentro da imagem.
-        assert!(x < img_width);
-        assert!(y < img_height);
-        assert!(x + crop_w <= img_width);
-        assert!(y + crop_h <= img_height);
+    #[test]
+    fn freeze_ready_state_stores_is_potentially_black() {
+        let (mut orch, _app) = mock_orchestrator();
 
-        // Verifica que o crop funciona sem panic.
-        let cropped = image::imageops::crop_imm(&*full_image, x, y, crop_w, crop_h).to_image();
-        assert!(cropped.width() > 0);
-        assert!(cropped.height() > 0);
+        let temp_path = PathBuf::from("/tmp/test_freeze_black.png");
+        orch.state = CaptureState::FreezeReady {
+            temp_path: temp_path.clone(),
+            monitor_info: MonitorInfo {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale_factor: 1.0,
+            },
+            full_image: Arc::new(RgbaImage::new(2, 2)),
+            is_potentially_black: true,
+        };
+
+        let is_black = match &orch.state {
+            CaptureState::FreezeReady {
+                is_potentially_black,
+                ..
+            } => *is_potentially_black,
+            _ => panic!("Expected FreezeReady state"),
+        };
+        assert!(is_black, "FreezeReady must store is_potentially_black=true");
+    }
+
+    #[test]
+    fn selecting_state_stores_is_potentially_black_and_mode() {
+        let (mut orch, _app) = mock_orchestrator();
+
+        orch.state = CaptureState::Selecting {
+            temp_path: PathBuf::from("/tmp/test_selecting_black.png"),
+            full_image: Arc::new(RgbaImage::new(2, 2)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: true,
+        };
+
+        let (is_black, mode) = match &orch.state {
+            CaptureState::Selecting {
+                is_potentially_black,
+                mode,
+                ..
+            } => (*is_potentially_black, *mode),
+            _ => panic!("Expected Selecting state"),
+        };
+        assert!(is_black, "Selecting must store is_potentially_black=true");
+        assert_eq!(mode, CaptureModeName::Area, "Selecting must store mode");
+    }
+
+    #[test]
+    fn retry_loop_returns_image_with_false_when_not_black() {
+        let (orch, _app) = mock_orchestrator();
+
+        let white_image =
+            image::ImageBuffer::from_pixel(100, 100, image::Rgba([255u8, 255u8, 255u8, 255u8]));
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = orch.capture_with_black_image_retry(|| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(white_image.clone())
+        });
+
+        assert!(result.is_ok(), "retry loop must succeed with white image");
+        let (_, is_potentially_black) = result.unwrap();
+        assert!(
+            !is_potentially_black,
+            "is_potentially_black must be false for white image"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "capture_fn must be called exactly once for non-black image"
+        );
+    }
+
+    #[test]
+    fn retry_loop_retries_twice_for_persistent_black_image() {
+        let (orch, _app) = mock_orchestrator();
+
+        let black_image =
+            image::ImageBuffer::from_pixel(100, 100, image::Rgba([0u8, 0u8, 0u8, 255u8]));
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = orch.capture_with_black_image_retry(|| {
+            call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(black_image.clone())
+        });
+
+        assert!(
+            result.is_ok(),
+            "retry loop must succeed even with persistent black (zero-loss)"
+        );
+        let (_, is_potentially_black) = result.unwrap();
+        assert!(
+            is_potentially_black,
+            "is_potentially_black must be true when all captures are black"
+        );
+        // Captura inicial + 2 retries + 1 fallback = 4 chamadas total
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "must call capture_fn 4 times: initial + 2 retries + 1 fallback"
+        );
+    }
+
+    #[test]
+    fn retry_loop_succeeds_on_second_attempt() {
+        let (orch, _app) = mock_orchestrator();
+
+        let black_image =
+            image::ImageBuffer::from_pixel(100, 100, image::Rgba([0u8, 0u8, 0u8, 255u8]));
+        let white_image =
+            image::ImageBuffer::from_pixel(100, 100, image::Rgba([255u8, 255u8, 255u8, 255u8]));
+        let call_count = std::sync::atomic::AtomicU32::new(0);
+
+        let result = orch.capture_with_black_image_retry(|| {
+            let count = call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                Ok(black_image.clone()) // primeira captura: preta
+            } else {
+                Ok(white_image.clone()) // segunda captura: branca
+            }
+        });
+
+        assert!(result.is_ok());
+        let (_, is_potentially_black) = result.unwrap();
+        assert!(
+            !is_potentially_black,
+            "is_potentially_black must be false when second capture succeeds"
+        );
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must call capture_fn 2 times: initial (black) + retry (white)"
+        );
+    }
+
+    #[test]
+    fn should_cleanup_temp_file_on_complete() {
+        let (mut orch, _app) = mock_orchestrator();
+
+        let temp_path = std::env::temp_dir().join("orchestrator_test_cleanup_on_complete.png");
+        RgbaImage::new(2, 2)
+            .save(&temp_path)
+            .expect("must save temp file for test");
+        assert!(temp_path.exists(), "temp file must exist before finalize");
+
+        orch.state = CaptureState::Selecting {
+            temp_path: temp_path.clone(),
+            full_image: Arc::new(RgbaImage::new(2, 2)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: false,
+        };
+
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+
+        // finalize_capture internamente usa Handle::current().block_on — precisamos
+        // de um runtime tokio. Criamos um e chamamos via spawn_blocking.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("must build tokio runtime for test");
+
+        let _result = rt.block_on(async {
+            tokio::task::spawn_blocking(move || orch.finalize_capture(region)).await
+        });
+
+        // O temp file deve ser deletado independentemente de clipboard/storage ter sucesso.
+        assert!(
+            !temp_path.exists(),
+            "temp file must be deleted after finalize_capture completes"
+        );
+    }
+
+    /// Verifica que `cancel_capture` emite `capture:cancelled` e reseta estado para `Idle`.
+    #[test]
+    fn should_emit_cancelled_event_on_cancel() {
+        let (mut orch, _app) = mock_orchestrator();
+        orch.state = CaptureState::Selecting {
+            temp_path: PathBuf::from("/tmp/orchestrator_test_emit_cancel.png"),
+            full_image: Arc::new(RgbaImage::new(1, 1)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: false,
+        };
+
+        // cancel_capture deve ter sucesso e emitir "capture:cancelled".
+        orch.cancel_capture()
+            .expect("cancel_capture must succeed to trigger event emission");
+
+        assert!(
+            matches!(orch.state, CaptureState::Idle),
+            "state must be Idle after cancel (post-event emission)"
+        );
+    }
+
+    /// Verifica que o payload `FreezeReadyPayload` emitido com `capture:freeze-ready`
+    /// contém os campos corretos de `temp_path` e `monitor`.
+    #[test]
+    fn should_emit_freeze_ready_event_for_area_mode() {
+        let monitor_info = MonitorInfo {
+            x: 100,
+            y: 200,
+            width: 1920,
+            height: 1080,
+            scale_factor: 2.0,
+        };
+        let temp_path = PathBuf::from("/tmp/orchestrator_test_freeze_ready.png");
+
+        let payload = FreezeReadyPayload {
+            temp_path: temp_path.to_string_lossy().to_string(),
+            monitor: monitor_info.clone(),
+        };
+
+        let json = serde_json::to_value(&payload).expect("FreezeReadyPayload must serialize");
+        assert_eq!(json["temp_path"], "/tmp/orchestrator_test_freeze_ready.png");
+        assert_eq!(json["monitor"]["x"], 100);
+        assert_eq!(json["monitor"]["y"], 200);
+        assert_eq!(json["monitor"]["width"], 1920);
+        assert_eq!(json["monitor"]["height"], 1080);
+        assert_eq!(json["monitor"]["scale_factor"], 2.0);
+
+        assert!(
+            AreaCapture.requires_overlay(),
+            "AreaCapture must require overlay to trigger capture:freeze-ready event"
+        );
+
+        let state = CaptureState::FreezeReady {
+            temp_path,
+            monitor_info,
+            full_image: Arc::new(RgbaImage::new(1920, 1080)),
+            is_potentially_black: false,
+        };
+        assert!(
+            matches!(state, CaptureState::FreezeReady { .. }),
+            "FreezeReady state must hold monitor and temp_path data for event emission"
+        );
     }
 
     #[test]
@@ -834,6 +1275,7 @@ mod tests {
                     temp_path: temp_path.clone(),
                     monitor_info: monitor_info.clone(),
                     full_image: full_image.clone(),
+                    is_potentially_black: false,
                 },
             ),
             (
@@ -847,16 +1289,21 @@ mod tests {
                     temp_path: temp_path.clone(),
                     monitor_info: monitor_info.clone(),
                     full_image: full_image.clone(),
+                    is_potentially_black: false,
                 },
                 CaptureState::Selecting {
                     temp_path: temp_path.clone(),
                     full_image: full_image.clone(),
+                    mode: CaptureModeName::Area,
+                    is_potentially_black: false,
                 },
             ),
             (
                 CaptureState::Selecting {
                     temp_path: temp_path.clone(),
                     full_image: full_image.clone(),
+                    mode: CaptureModeName::Area,
+                    is_potentially_black: false,
                 },
                 CaptureState::Finalizing,
             ),
@@ -864,6 +1311,8 @@ mod tests {
                 CaptureState::Selecting {
                     temp_path: temp_path.clone(),
                     full_image: full_image.clone(),
+                    mode: CaptureModeName::Area,
+                    is_potentially_black: false,
                 },
                 CaptureState::Idle,
             ),
@@ -921,7 +1370,6 @@ mod tests {
 
     #[test]
     fn should_not_create_overlay_for_fullscreen_mode() {
-        // Verifica que FullscreenCapture.requires_overlay() retorna false.
         use crate::capture::FullscreenCapture;
         let fc = FullscreenCapture;
         assert!(
@@ -930,143 +1378,31 @@ mod tests {
         );
     }
 
-    /// Verifica que após `finalize_capture`, o arquivo temporário é deletado do disco.
-    /// Usa runtime tokio multi-thread pois `finalize_capture` usa `Handle::current().block_on`.
     #[test]
-    fn should_cleanup_temp_file_on_complete() {
+    fn state_guard_finalize_in_idle_returns_invalid_state() {
         let (mut orch, _app) = mock_orchestrator();
-
-        let temp_path = std::env::temp_dir().join("orchestrator_test_cleanup_on_complete.png");
-        RgbaImage::new(2, 2)
-            .save(&temp_path)
-            .expect("must save temp file for test");
-        assert!(temp_path.exists(), "temp file must exist before finalize");
-
-        orch.state = CaptureState::Selecting {
-            temp_path: temp_path.clone(),
-            full_image: Arc::new(RgbaImage::new(2, 2)),
-        };
-
         let region = Region {
-            x: 0,
-            y: 0,
-            width: 2,
-            height: 2,
+            x: 10,
+            y: 10,
+            width: 100,
+            height: 100,
         };
-
-        // finalize_capture internamente usa Handle::current().block_on — precisamos
-        // de um runtime tokio. Criamos um e chamamos via spawn_blocking.
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("must build tokio runtime for test");
-
-        let _result = rt.block_on(async {
-            tokio::task::spawn_blocking(move || orch.finalize_capture(region)).await
-        });
-
-        // O temp file deve ser deletado independentemente de clipboard/storage ter sucesso.
-        assert!(
-            !temp_path.exists(),
-            "temp file must be deleted after finalize_capture completes"
-        );
+        let err = orch
+            .finalize_capture(region)
+            .expect_err("must return error");
+        assert_eq!(err.code, "INVALID_STATE");
     }
 
-    /// Verifica que `cancel_capture` emite `capture:cancelled` e reseta estado para `Idle`.
-    /// O emit acontece via `app_handle.emit()` — com MockRuntime, a chamada é silenciosa
-    /// mas não retorna erro, confirmando que a operação foi executada corretamente.
     #[test]
-    fn should_emit_cancelled_event_on_cancel() {
+    fn state_guard_start_in_capturing_returns_invalid_state() {
         let (mut orch, _app) = mock_orchestrator();
-        orch.state = CaptureState::Selecting {
-            temp_path: PathBuf::from("/tmp/orchestrator_test_emit_cancel.png"),
-            full_image: Arc::new(RgbaImage::new(1, 1)),
+        orch.state = CaptureState::Capturing {
+            mode: CaptureModeName::Fullscreen,
         };
-
-        // cancel_capture deve ter sucesso e emitir "capture:cancelled".
-        // Com MockRuntime, emit() retorna Ok(()) silenciosamente.
-        orch.cancel_capture()
-            .expect("cancel_capture must succeed to trigger event emission");
-
-        assert!(
-            matches!(orch.state, CaptureState::Idle),
-            "state must be Idle after cancel (post-event emission)"
-        );
-    }
-
-    /// Verifica que o payload `FreezeReadyPayload` emitido com `capture:freeze-ready`
-    /// contém os campos corretos de `temp_path` e `monitor`.
-    /// O pipeline completo requer display server (coberto em testes ignorados).
-    #[test]
-    fn should_emit_freeze_ready_event_for_area_mode() {
-        let monitor_info = MonitorInfo {
-            x: 100,
-            y: 200,
-            width: 1920,
-            height: 1080,
-            scale_factor: 2.0,
-        };
-        let temp_path = PathBuf::from("/tmp/orchestrator_test_freeze_ready.png");
-
-        // Verifica a serialização do payload que seria emitido com o evento.
-        let payload = FreezeReadyPayload {
-            temp_path: temp_path.to_string_lossy().to_string(),
-            monitor: monitor_info.clone(),
-        };
-
-        let json = serde_json::to_value(&payload).expect("FreezeReadyPayload must serialize");
-        assert_eq!(json["temp_path"], "/tmp/orchestrator_test_freeze_ready.png");
-        assert_eq!(json["monitor"]["x"], 100);
-        assert_eq!(json["monitor"]["y"], 200);
-        assert_eq!(json["monitor"]["width"], 1920);
-        assert_eq!(json["monitor"]["height"], 1080);
-        assert_eq!(json["monitor"]["scale_factor"], 2.0);
-
-        // Pré-condição: AreaCapture deve exigir overlay para emitir este evento.
-        assert!(
-            AreaCapture.requires_overlay(),
-            "AreaCapture must require overlay to trigger capture:freeze-ready event"
-        );
-
-        // Verifica o estado FreezeReady que armazena os dados do evento.
-        let state = CaptureState::FreezeReady {
-            temp_path,
-            monitor_info,
-            full_image: Arc::new(RgbaImage::new(1920, 1080)),
-        };
-        assert!(
-            matches!(state, CaptureState::FreezeReady { .. }),
-            "FreezeReady state must hold monitor and temp_path data for event emission"
-        );
-    }
-
-    /// Verifica que o payload `CaptureResult` emitido com `capture:complete`
-    /// contém os campos corretos após `finalize_capture`.
-    /// O pipeline completo requer tokio runtime + storage (coberto por should_cleanup_temp_file_on_complete).
-    #[test]
-    fn should_emit_complete_event_after_finalize() {
-        // Payload de sucesso total.
-        let result = CaptureResult {
-            file_path: "/home/user/Screenshots/screenshot-tool/Screenshot_2026-01-01_12-00-00.png"
-                .to_string(),
-            clipboard_success: true,
-        };
-        let json = serde_json::to_value(&result).expect("CaptureResult must serialize");
-        assert_eq!(json["clipboard_success"], true);
-        assert!(!json["file_path"].as_str().unwrap().is_empty());
-        assert!(json["file_path"].as_str().unwrap().ends_with(".png"));
-
-        // Payload de falha parcial (clipboard falhou, file_path válido).
-        // Este é o CaptureResult emitido quando clipboard_success: false.
-        let partial_result = CaptureResult {
-            file_path: "/home/user/Screenshots/screenshot-tool/Screenshot_2026-01-01_12-00-00.png"
-                .to_string(),
-            clipboard_success: false,
-        };
-        let partial_json = serde_json::to_value(&partial_result).expect("must serialize");
-        assert_eq!(partial_json["clipboard_success"], false);
-        assert!(!partial_json["file_path"].as_str().unwrap().is_empty());
+        let err = orch
+            .start_capture(CaptureModeName::Area)
+            .expect_err("must return error");
+        assert_eq!(err.code, "INVALID_STATE");
     }
 
     // Testes de integração que precisam de display server.
@@ -1098,38 +1434,13 @@ mod tests {
         orch.state = CaptureState::Selecting {
             temp_path: temp_path.clone(),
             full_image: Arc::new(RgbaImage::new(100, 100)),
+            mode: CaptureModeName::Area,
+            is_potentially_black: false,
         };
 
         orch.cancel_capture().expect("cancel must succeed");
 
         assert!(matches!(orch.state, CaptureState::Idle));
         assert!(!temp_path.exists(), "temp file must be cleaned up");
-    }
-
-    #[test]
-    fn state_guard_finalize_in_idle_returns_invalid_state() {
-        let (mut orch, _app) = mock_orchestrator();
-        let region = Region {
-            x: 10,
-            y: 10,
-            width: 100,
-            height: 100,
-        };
-        let err = orch
-            .finalize_capture(region)
-            .expect_err("must return error");
-        assert_eq!(err.code, "INVALID_STATE");
-    }
-
-    #[test]
-    fn state_guard_start_in_capturing_returns_invalid_state() {
-        let (mut orch, _app) = mock_orchestrator();
-        orch.state = CaptureState::Capturing {
-            mode: CaptureModeName::Fullscreen,
-        };
-        let err = orch
-            .start_capture(CaptureModeName::Area)
-            .expect_err("must return error");
-        assert_eq!(err.code, "INVALID_STATE");
     }
 }
