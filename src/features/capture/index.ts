@@ -1,4 +1,4 @@
-export { cancelCapture, finalizeCapture, startCapture } from "./captureCommands";
+export { cancelCapture, finalizeCapture, getFreezeData, startCapture } from "./captureCommands";
 export { useCaptureEvents } from "./useCaptureEvents";
 export type { UseCaptureEventsOptions } from "./useCaptureEvents";
 export type {

@@ -83,6 +83,7 @@ pub fn run() {
             commands::start_capture,
             commands::finalize_capture,
             commands::cancel_capture,
+            commands::get_freeze_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

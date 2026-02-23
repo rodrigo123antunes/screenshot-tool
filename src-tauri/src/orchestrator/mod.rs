@@ -65,6 +65,9 @@ impl CaptureState {
 pub struct CaptureOrchestrator<R: Runtime = tauri::Wry> {
     pub(crate) state: CaptureState,
     app_handle: AppHandle<R>,
+    /// Cache do último FreezeReadyPayload para o overlay buscar via IPC.
+    /// Resolvido race condition: o overlay pode não ter montado quando o evento é emitido.
+    last_freeze_payload: Option<FreezeReadyPayload>,
 }
 
 impl<R: Runtime> CaptureOrchestrator<R> {
@@ -72,6 +75,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
         Self {
             state: CaptureState::Idle,
             app_handle,
+            last_freeze_payload: None,
         }
     }
 
@@ -163,6 +167,12 @@ impl<R: Runtime> CaptureOrchestrator<R> {
             height,
             scale_factor,
         })
+    }
+
+    /// Retorna o payload de freeze cacheado, se existir.
+    /// Usado pelo overlay como fallback para a race condition do evento `capture:freeze-ready`.
+    pub fn get_freeze_data(&self) -> Option<FreezeReadyPayload> {
+        self.last_freeze_payload.clone()
     }
 
     /// Inicia o pipeline de captura no modo especificado.
@@ -268,14 +278,15 @@ impl<R: Runtime> CaptureOrchestrator<R> {
                 monitor_info.y
             );
 
+            let freeze_payload = FreezeReadyPayload {
+                temp_path: temp_path.to_string_lossy().to_string(),
+                monitor: monitor_info,
+            };
+
+            self.last_freeze_payload = Some(freeze_payload.clone());
+
             self.app_handle
-                .emit(
-                    "capture:freeze-ready",
-                    FreezeReadyPayload {
-                        temp_path: temp_path.to_string_lossy().to_string(),
-                        monitor: monitor_info,
-                    },
-                )
+                .emit("capture:freeze-ready", freeze_payload)
                 .map_err(|e| {
                     StructuredError::internal(format!("Failed to emit capture:freeze-ready: {e}"))
                 })?;
@@ -483,6 +494,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
 
         self.destroy_overlay_window().ok();
         self.cleanup_temp_file(&temp_path);
+        self.last_freeze_payload = None;
         self.app_handle
             .emit("capture:complete", result.clone())
             .ok();
@@ -514,6 +526,7 @@ impl<R: Runtime> CaptureOrchestrator<R> {
 
         self.destroy_overlay_window().ok();
         self.app_handle.emit("capture:cancelled", ()).ok();
+        self.last_freeze_payload = None;
         self.state = CaptureState::Idle;
 
         tracing::info!("Capture cancelled, reset to Idle");

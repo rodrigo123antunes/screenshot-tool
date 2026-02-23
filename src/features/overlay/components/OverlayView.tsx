@@ -1,6 +1,7 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
+import { getFreezeData } from "@/features/capture/captureCommands";
 import { useCaptureEvents } from "@/features/capture/useCaptureEvents";
 
 import type { FreezeReadyPayload } from "@/features/capture/types";
@@ -13,12 +14,14 @@ export function OverlayView() {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [isFlashing, setIsFlashing] = useState(false);
 
+  const applyFreezePayload = (payload: FreezeReadyPayload) => {
+    const url = convertFileSrc(payload.temp_path);
+    setFreezePayload(payload);
+    setImageUrl(url);
+  };
+
   useCaptureEvents({
-    onFreezeReady: (payload) => {
-      const url = convertFileSrc(payload.temp_path);
-      setFreezePayload(payload);
-      setImageUrl(url);
-    },
+    onFreezeReady: applyFreezePayload,
     onComplete: () => {
       setIsFlashing(true);
       setTimeout(() => {
@@ -30,6 +33,15 @@ export function OverlayView() {
       setImageUrl(null);
     },
   });
+
+  // Fallback: busca freeze data via IPC ao montar, caso o evento tenha sido perdido.
+  useEffect(() => {
+    getFreezeData().then((payload) => {
+      if (payload) {
+        applyFreezePayload(payload);
+      }
+    });
+  }, []);
 
   return (
     <div

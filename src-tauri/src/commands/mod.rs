@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::State;
 
-use crate::capture::{CaptureModeName, CaptureResult, Region};
+use crate::capture::{CaptureModeName, CaptureResult, FreezeReadyPayload, Region};
 use crate::error::StructuredError;
 use crate::orchestrator::CaptureOrchestrator;
 
@@ -44,6 +44,19 @@ pub async fn finalize_capture(
     })
     .await
     .map_err(|e| StructuredError::internal(format!("finalize_capture task panicked: {e}")))?
+}
+
+/// Retorna o FreezeReadyPayload cacheado se houver captura com overlay em andamento.
+///
+/// Fallback para race condition: o overlay pode montar depois do evento `capture:freeze-ready`.
+#[tauri::command]
+pub async fn get_freeze_data(
+    orchestrator: State<'_, Arc<Mutex<CaptureOrchestrator>>>,
+) -> Result<Option<FreezeReadyPayload>, StructuredError> {
+    let guard = orchestrator
+        .lock()
+        .map_err(|_| StructuredError::internal("Orchestrator mutex poisoned"))?;
+    Ok(guard.get_freeze_data())
 }
 
 /// Cancela captura em andamento.
