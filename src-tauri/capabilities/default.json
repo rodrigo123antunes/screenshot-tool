@@ -12,6 +12,10 @@
     "core:window:allow-close",
     "core:window:allow-set-always-on-top",
     "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister"
+    "global-shortcut:allow-unregister",
+    "notification:default",
+    "notification:allow-show",
+    "notification:allow-request-permission",
+    "notification:allow-is-permission-granted"
   ]
 }

@@ -14,8 +14,11 @@ export interface MonitorInfo {
 }
 
 export interface CaptureResult {
-  file_path: string;
-  clipboard_success: boolean;
+  path: string;
+  width: number;
+  height: number;
+  file_size: number;
+  is_black_warning: boolean;
 }
 
 export interface StructuredError {
