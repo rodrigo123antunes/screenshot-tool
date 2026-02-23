@@ -1,0 +1,12 @@
+# This file is auto-generated — paths are relative to the dev-libs directory.
+# The PKG_CONFIG_PATH must point to this directory for pkg-config to find it.
+prefix=${pcfiledir}/..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: libspa-0.2
+Description: Simple Plugin API (dev stub for build without libpipewire-0.3-dev)
+Version: 1.0.2
+Libs: -L${libdir} -lpipewire-0.3
+Cflags: -I${includedir}
