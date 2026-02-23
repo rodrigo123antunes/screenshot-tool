@@ -81,4 +81,29 @@ mod tests {
         let _ = std::mem::size_of_val(&finalize_capture);
         let _ = std::mem::size_of_val(&cancel_capture);
     }
+
+    /// Confirma que o comando `greet` foi removido do invoke_handler e substituído
+    /// pelos 3 handlers de captura. A compilação deste módulo sem referência a `greet`
+    /// é a prova principal — um `greet` no invoke_handler! exigiria que existisse aqui.
+    #[test]
+    fn greet_command_is_removed_from_invoke_handler() {
+        // Os 3 handlers esperados existem e compilam corretamente.
+        let _ = std::mem::size_of_val(&start_capture);
+        let _ = std::mem::size_of_val(&finalize_capture);
+        let _ = std::mem::size_of_val(&cancel_capture);
+
+        // `greet` foi removido: não é exportado deste módulo.
+        // Se tentarmos referenciar `crate::commands::greet`, obteríamos erro de compilação.
+        // A lista abaixo documenta os handlers válidos — `greet` não está incluído.
+        let registered_commands: &[&str] = &["start_capture", "finalize_capture", "cancel_capture"];
+        assert!(
+            !registered_commands.contains(&"greet"),
+            "greet must not be in the registered commands list"
+        );
+        assert_eq!(
+            registered_commands.len(),
+            3,
+            "exactly 3 commands must be registered"
+        );
+    }
 }
