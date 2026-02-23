@@ -2,6 +2,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod commands;
 pub mod error;
+pub mod image_processor;
 pub mod orchestrator;
 pub mod storage;
 
